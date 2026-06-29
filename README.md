@@ -121,3 +121,39 @@ Served as `deepseek/v4flashdspark` on `:8001` (OpenAI-compatible).
 - DSpark reference: DeepSeek `DeepSeek-V4-Flash-DSpark`; vLLM port lineage from the
   jasl sm120 fork + rafaelcaricio's DSpark integration. This repo ports that onto
   the b12x image and fixes the draft-RoPE acceptance bug.
+
+---
+
+## Update (2026-06-29): concurrency support, high-context fix, and the benchmark result
+
+### Benchmarks vs the localmaxxing DeepSeek-V4-Flash run (MTP, 181 tok/s)
+Server-side decode throughput (`Avg generation throughput`, pure-decode windows, single stream, greedy, 262k-ctx config). **Content-dependent** — acceptance drives throughput:
+
+| workload | context | DSpark decode tok/s | accept_len |
+|---|---|---|---|
+| **code / structured** | ~29k | **~262** (peak 278) | 4.5 |
+| code / structured | ~82k | ~237 | 4.8 |
+| reasoning (thinking=high) | 37k | ~187 | 3.3 |
+| localmaxxing bench (MTP n=1) | 37.7k | 181 | — |
+
+**Direct head-to-head, identical code prompts at 262k:** DSpark (num_spec=5) **~262 tok/s @ accept 4.5** vs MTP (num_spec=2) **~208 tok/s @ accept 2.6** — DSpark **+26%**. DSpark's higher acceptance more than pays for its heavier 6-position verify on structured content; on high-entropy reasoning the gap narrows (acceptance is content-bound).
+
+> Measure server-side throughput, not the client. Speculative decoding emits tokens in **bursts**, so client-side SSE timing inflates decode rate (burst buffering) and prefix-cache asymmetry deflates differential timing. The engine's `Avg generation throughput` log is the truth.
+
+### Concurrency (`max_num_seqs > 1`) — now supported
+The original DSpark serving path forced single-request processing (two bugs, diagnosed by **[drowzeys/Keys-Concurrency-Patch](https://github.com/drowzeys/Keys-Concurrency-Patch-for-DSpark-DeepSeek-V4-Flash)**): (1) the persistent draft `main_kv_cache` was keyed by **batch-row position**, so when continuous batching condensed the running set after a request finished, a request drafted against another's KV → acceptance collapse; (2) the context-prep assumed **uniform per-request rows**, raising `ValueError` under chunked prefill. This port fixes both:
+- **Stable req-id→slot map** (always-on; identity fast-path keeps single-stream byte-identical) so the draft KV window follows the request across condense.
+- **Ragged `query_start_loc` context path** (gated `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`) for mixed prefill+decode steps; permuted-slot steps run the draft eager so the captured fixed-shape cudagraph is never replayed with a remapped index.
+
+Validated: under sustained load (2 long requests always in flight + constant short finishers forcing condense), acceptance held at **4.19** (vs 4.52 single-stream), **zero incoherent/errored outputs**, no `ValueError`; single-stream speed unchanged.
+
+### High-context (`BT_COPY_TRIM`, `INDEXER_PT_TRIM`)
+At large `--max-model-len`, per-step block-table structures are sized by `cdiv(max_model_len, block_size)` regardless of live context. `VLLM_DSPARK_BT_COPY_TRIM=1` (default on) trims the expansion **copy** to live context (needle-validated to 120k). The 1M config is still ~25% slower than 262k at fixed context because the **indexer hands the full page-table width to the b12x topk kernel**; `VLLM_DSPARK_INDEXER_PT_TRIM=1` (experimental, default off) trims that too — A/B it at your context.
+
+### Env flags added this round
+- `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1` — enable the ragged concurrency path.
+- `VLLM_DSPARK_BT_COPY_TRIM` (default `1`) — trim per-step block-table copy to live context.
+- `VLLM_DSPARK_INDEXER_PT_TRIM` (default `0`, experimental) — trim indexer page-table width.
+- `VLLM_DSPARK_BF16_O_PROJ` (default `0`) — bf16 draft o-proj (matches reference; measured throughput-neutral).
+
+See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for the people and projects this builds on.

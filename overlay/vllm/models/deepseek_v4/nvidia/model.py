@@ -1546,6 +1546,46 @@ class DeepseekV4Model(nn.Module):
                         post_mix.clone(),
                         res_mix.clone(),
                     )
+                # One-time A/B self-check of the DSpark seed path: the b12x
+                # capture-safe post must compute the SAME function as the
+                # tilelang reference post that the drafter was validated
+                # against. A small rel-diff (~fp8/bf16 rounding) => the seed is
+                # faithful and low acceptance is NOT a seed bug. A large
+                # rel-diff => b12x_mhc_post is a different reduction and is
+                # corrupting the seed at every position. Set
+                # VLLM_DSPARK_SEED_SELFCHECK=1 to enable; mirrors the
+                # _check_bf16_o_proj pattern in dspark.py.
+                import os as _os
+
+                if (
+                    _os.environ.get("VLLM_DSPARK_SEED_SELFCHECK", "0") == "1"
+                    and not getattr(self, "_dspark_seed_checked", False)
+                    and layer._should_run_b12x_mhc(int(hidden_states.shape[0]))
+                ):
+                    self._dspark_seed_checked = True
+                    try:
+                        ref_clean = mhc_post_tilelang(
+                            hidden_states.clone(),
+                            residual.clone(),
+                            post_mix.clone(),
+                            res_mix.clone(),
+                        )
+                        num = (clean.float() - ref_clean.float()).norm()
+                        den = ref_clean.float().norm() + 1e-6
+                        logger.info(
+                            "DSpark seed self-check (layer %d): "
+                            "rel-diff b12x_mhc_post vs mhc_post_tilelang = "
+                            "%.4f (~0.01-0.05 = bf16/fp8 rounding, seed OK; "
+                            ">0.3 = b12x post is a different reduction, seed "
+                            "bug)",
+                            idx,
+                            (num / den).item(),
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "DSpark seed self-check failed: %s", e
+                        )
+
                 aux_hidden_states.append(clean.mean(dim=1))
         if layer is not None:
             assert residual is not None

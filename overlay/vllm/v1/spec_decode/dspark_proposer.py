@@ -76,6 +76,24 @@ class DSparkProposer(SpecDecodeBaseProposer):
             dtype=torch.long,
             device=device,
         )
+        # Bug 1: stable per-request KV-slot mapping. The persistent draft KV
+        # window lives at a fixed row in the model's main_kv_cache; vLLM-v1
+        # continuous batching condenses the running set when a request finishes,
+        # so the batch-ROW position is not stable across steps. We map req-id ->
+        # slot so reads/writes always hit the right request's window.
+        self._req_id_to_slot: dict[str, int] = {}
+        self._free_slots: list[int] = list(range(self.max_batch_size))
+        # Persistent buffer for the per-row -> slot permutation handed to the
+        # draft read. Initialized to identity so capture/warmup/single-stream
+        # stay byte-identical. `_active_slot_index` is None on the identity
+        # fast-path (no index_select; original code path) and otherwise a view
+        # of this buffer.
+        self._draft_slot_index_buffer = torch.arange(
+            self.max_batch_size,
+            dtype=torch.long,
+            device=device,
+        )
+        self._active_slot_index: torch.Tensor | None = None
         self.diagnostics = DSparkDiagnostics(
             max_spec_tokens=self.num_speculative_tokens
         )
@@ -481,6 +499,10 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = self._draft_graph_batch_size
+        # _active_slot_index is None on the identity fast-path (single stream /
+        # no condense), which keeps the original read path byte-identical and
+        # cudagraph-replay-safe. When slots are permuted it is a buffer view of
+        # length batch_size and the draft is run eager (see propose()).
         return self.model.draft_with_confidence(
             self._draft_input_ids_buffer[:batch_size],
             self._draft_hidden_buffer[:batch_size],
@@ -488,12 +510,58 @@ class DSparkProposer(SpecDecodeBaseProposer):
             return_logits=self._needs_draft_logits(),
             return_confidence=self._needs_confidence(),
             store_main_kv=False,
+            slot_index=self._active_slot_index,
         )
+
+    def _resolve_slots(
+        self,
+        req_ids: list[str] | None,
+        batch_size: int,
+    ) -> torch.Tensor | None:
+        """Map this step's requests (in batch-row order) to stable KV slots.
+
+        Returns None when the resolved permutation is the identity
+        [0, 1, ..., batch_size - 1] so callers take the original byte-identical
+        fast-path. Otherwise returns a length-`batch_size` long tensor whose
+        i-th entry is the persistent main_kv_cache row for batch row i.
+        """
+        if req_ids is None:
+            return None
+        if len(req_ids) != batch_size:
+            # Defensive: if the runner's row-ordered req-id list does not match
+            # the tensor batch dim, fall back to the original behavior rather
+            # than risk mismapping KV.
+            return None
+
+        live = set(req_ids)
+        # Reclaim slots from requests that are no longer running.
+        for stale in [r for r in self._req_id_to_slot if r not in live]:
+            self._free_slots.append(self._req_id_to_slot.pop(stale))
+        # Lowest-first reuse keeps the identity permutation stable for the
+        # common single-stream / append-only case.
+        self._free_slots = sorted(set(self._free_slots))
+
+        slots: list[int] = []
+        for req_id in req_ids:
+            slot = self._req_id_to_slot.get(req_id)
+            if slot is None:
+                slot = self._free_slots.pop(0)
+                self._req_id_to_slot[req_id] = slot
+            slots.append(slot)
+
+        if slots == list(range(batch_size)):
+            return None
+        self._draft_slot_index_buffer[:batch_size].copy_(
+            torch.tensor(slots, dtype=torch.long, device=self.device)
+        )
+        return self._draft_slot_index_buffer[:batch_size]
 
     def _run_draft_for_current_context(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self._draft_graph_runner is not None:
+        # A permuted slot index must bypass the captured graph (recorded with the
+        # identity index_select and fixed padded shapes); run the draft eager.
+        if self._draft_graph_runner is not None and self._active_slot_index is None:
             return self._draft_graph_runner()
         return self._run_draft_from_buffers()
 
@@ -526,6 +594,95 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 f"got {positions.shape[0]} rows for batch_size={batch_size}."
             )
         return positions.view(batch_size, positions.shape[0] // batch_size)
+
+    def _query_start_loc_cpu(
+        self,
+        common_attn_metadata: CommonAttentionMetadata | None,
+    ) -> torch.Tensor | None:
+        if common_attn_metadata is None:
+            return None
+        qsl_cpu = common_attn_metadata.query_start_loc_cpu
+        if qsl_cpu is None:
+            qsl = common_attn_metadata.query_start_loc
+            if qsl is None:
+                return None
+            qsl_cpu = qsl.detach().cpu()
+        return qsl_cpu
+
+    def _maybe_ragged_query_start_loc(
+        self,
+        common_attn_metadata: CommonAttentionMetadata | None,
+        batch_size: int,
+        target_hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Return query_start_loc (on device) iff per-request rows are ragged.
+
+        Raggedness (unequal per-request segment lengths) only happens with
+        chunked prefill mixing prefill + decode in one step. For a uniform
+        batch we return None so the caller keeps the rectangular fast-path.
+        """
+        qsl_cpu = self._query_start_loc_cpu(common_attn_metadata)
+        if qsl_cpu is None:
+            return None
+        if qsl_cpu.numel() != batch_size + 1:
+            return None
+        starts = qsl_cpu.to(torch.long).tolist()
+        # The flat hidden tensor must cover exactly the segmented rows.
+        if starts[-1] != target_hidden_states.shape[0]:
+            return None
+        lengths = [starts[i + 1] - starts[i] for i in range(batch_size)]
+        if len(set(lengths)) <= 1:
+            # Uniform -> rectangular fast-path (byte-identical).
+            return None
+        return qsl_cpu.to(device=self.device, dtype=torch.long)
+
+    def _prepare_context_ragged(
+        self,
+        target_hidden_states: torch.Tensor,
+        target_positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        batch_size: int,
+        rejected_for_gpu_mask: torch.Tensor | None,
+    ):
+        """Ragged context-prep using query_start_loc segment offsets.
+
+        Returns flat hidden/positions (passed straight to the ragged
+        prefill_main) plus per-request last-row hidden/positions for the draft.
+        No rectangular [B, seq, H] view is taken, so per-request row counts may
+        differ. Runs eager.
+        """
+        flat_hidden = target_hidden_states.reshape(
+            -1, target_hidden_states.shape[-1]
+        )
+        flat_positions = target_positions.reshape(-1)
+        starts = query_start_loc.to(torch.long)
+        # last row of each request segment, optionally backed off by the
+        # request's rejected-suffix count.
+        seg_starts = starts[:batch_size]
+        seg_ends = starts[1 : batch_size + 1]
+        last_offsets = (seg_ends - seg_starts - 1).clamp(min=0)
+        if rejected_for_gpu_mask is not None:
+            rejected = rejected_for_gpu_mask.to(
+                device=self.device,
+                dtype=torch.long,
+                non_blocking=True,
+            ).view(batch_size)
+            last_offsets = (last_offsets - rejected).clamp(min=0)
+        anchor_idx = (seg_starts + last_offsets).clamp(
+            min=0, max=flat_hidden.shape[0] - 1
+        )
+        last_hidden = flat_hidden.index_select(0, anchor_idx).contiguous()
+        last_positions = flat_positions.index_select(0, anchor_idx).contiguous()
+        # hidden_by_req / positions_by_req carry the flat tensors here; the
+        # ragged prefill_main consumes them together with query_start_loc.
+        return (
+            flat_hidden,
+            flat_positions,
+            last_hidden,
+            last_positions,
+            rejected_for_gpu_mask,
+            query_start_loc,
+        )
 
     def _trim_rejected_target_context(
         self,
@@ -725,6 +882,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
         | list[dict[str, torch.Tensor]]
         | None = None,
         num_speculative_tokens: int | None = None,
+        req_ids: list[str] | None = None,
     ) -> torch.Tensor:
         # num_speculative_tokens is fixed at the DSpark block size; the jasl
         # gpu_model_runner passes it for other proposers — accept and ignore.
@@ -739,16 +897,21 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self._last_confidence = None
         total_started = time.perf_counter()
         batch_size = self._batch_size(next_token_ids)
+        # Bug 1: resolve a stable per-request KV slot for each batch row. None on
+        # the identity permutation (single stream / no condense) -> original
+        # byte-identical path. A permuted index forces eager draft below so the
+        # captured cudagraph (fixed-shape, identity-only) is never replayed with
+        # a permuted index_select.
+        slot_index = self._resolve_slots(req_ids, batch_size)
+        self._active_slot_index = slot_index
 
         def prepare_context():
             nonlocal target_hidden_states, target_positions
             rejected_for_gpu_mask = None
-            if (
-                getattr(self, "_gpu_rejected_context_mask", False)
-                and num_rejected_tokens_gpu is not None
-            ):
+            gpu_mask_on = getattr(self, "_gpu_rejected_context_mask", False)
+            if gpu_mask_on and num_rejected_tokens_gpu is not None:
                 rejected_for_gpu_mask = num_rejected_tokens_gpu
-            else:
+            elif not gpu_mask_on:
                 target_hidden_states, target_positions = (
                     self._trim_rejected_target_context(
                         target_hidden_states,
@@ -757,6 +920,27 @@ class DSparkProposer(SpecDecodeBaseProposer):
                         num_rejected_tokens_gpu,
                     )
                 )
+
+            # Bug 2: under the GPU rejected-context mask, detect ragged
+            # per-request rows (chunked-prefill mixed prefill+decode step) from
+            # query_start_loc and take a flat/ragged path. The uniform batch
+            # keeps the original rectangular _view_by_request fast-path
+            # (byte-identical). The ragged path runs eager in prefill_main.
+            query_start_loc = None
+            if gpu_mask_on:
+                query_start_loc = self._maybe_ragged_query_start_loc(
+                    common_attn_metadata, batch_size, target_hidden_states
+                )
+
+            if query_start_loc is not None:
+                return self._prepare_context_ragged(
+                    target_hidden_states,
+                    target_positions,
+                    query_start_loc,
+                    batch_size,
+                    rejected_for_gpu_mask,
+                )
+
             hidden_by_req = self._view_by_request(target_hidden_states, batch_size)
             positions_by_req = self._positions_by_request(target_positions, batch_size)
 
@@ -784,8 +968,13 @@ class DSparkProposer(SpecDecodeBaseProposer):
             else:
                 last_hidden = hidden_by_req[:, -1].contiguous()
                 last_positions = positions_by_req[:, -1].contiguous()
-            return hidden_by_req, positions_by_req, last_hidden, last_positions, (
-                rejected_for_gpu_mask
+            return (
+                hidden_by_req,
+                positions_by_req,
+                last_hidden,
+                last_positions,
+                rejected_for_gpu_mask,
+                None,
             )
 
         (
@@ -794,6 +983,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
             last_hidden,
             last_positions,
             rejected_for_gpu_mask,
+            ragged_query_start_loc,
         ) = self._timed_stage("context_prepare", prepare_context)
 
         self._timed_stage(
@@ -802,6 +992,8 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 hidden_by_req,
                 positions_by_req,
                 num_rejected_tokens=rejected_for_gpu_mask,
+                slot_index=slot_index,
+                query_start_loc=ragged_query_start_loc,
             ),
         )
         if not self._prefilled:
@@ -814,7 +1006,15 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 padded_batch_size,
                 num_tokens_across_dp,
                 batch_descriptor,
-            ) = self._determine_graph_batch(batch_size)
+            ) = self._determine_graph_batch(
+                batch_size,
+                # A permuted slot index must run eager: the captured graph was
+                # recorded with the identity index_select and fixed (padded)
+                # shapes. Disabling cudagraphs here also makes padded_batch_size
+                # == batch_size so the length-batch_size slot index lines up with
+                # the draft buffers (no padded rows to mis-slot).
+                use_cudagraphs=slot_index is None,
+            )
             self._prepare_draft_buffers(
                 input_ids=next_token_ids,
                 hidden_states=last_hidden,

@@ -5100,6 +5100,12 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
+            # DSpark keys its persistent per-request draft KV window by a stable
+            # req-id -> slot map (Bug 1). Pass the row-ordered req-id list only
+            # for DSpark so other proposers' propose() signatures are untouched.
+            extra_propose_kwargs: dict[str, Any] = {}
+            if isinstance(self.drafter, DSparkProposer):
+                extra_propose_kwargs["req_ids"] = list(self.input_batch.req_ids)
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -5111,6 +5117,7 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
+                **extra_propose_kwargs,
             )
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()

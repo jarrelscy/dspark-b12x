@@ -47,3 +47,24 @@ raised acceptance, which cuts the number of verifies → the throughput gain.
 ./setup.sh && docker compose -f docker-compose.dspark-b12x.yaml up -d
 python3 bench.py                  # see repo; edit MODEL=deepseek/v4flash[dspark]
 ```
+
+---
+
+## 2026-06-29 — server-side decode (the reliable method), vs localmaxxing MTP bench (181 tok/s)
+
+Measured from the engine's `Avg generation throughput` over pure-decode windows (single stream, greedy, 262k cfg). Throughput is content-dependent (acceptance-driven):
+
+| workload | ctx | DSpark tok/s | accept_len | MTP tok/s | MTP accept |
+|---|---|---|---|---|---|
+| code/structured | ~29k | **262** (257-278) | 4.5 | ~208 | 2.6 |
+| code/structured | ~82k | 237 | 4.8 | — | — |
+| reasoning (think=high) | 37k | 187 (160-215) | 3.3 | ~181 (bench) | — |
+| 1M-config, code | ~29k | 196 | 4.45 | — | — |
+
+**DSpark beats MTP by ~26% on identical code prompts** (262 vs 208), and beats the 181 reasoning bench on reasoning (187). 1M config is ~25% slower than 262k at fixed context (indexer page-table width; see `VLLM_DSPARK_INDEXER_PT_TRIM`).
+
+### Concurrency (max_num_seqs>1)
+Sustained 2-in-flight + short finishers (forces batch condense): accept_len **4.19** (vs 4.52 single-stream), 0 incoherent/errored, no ValueError. Single-stream speed unchanged.
+
+### Measurement caveat
+Client-side streaming **inflates** decode rate (spec-decode token bursts buffer on the client → compressed inter-token window); differential timing **deflates** it (prefix-cache asymmetry). Trust the server `Avg generation throughput`.

@@ -215,6 +215,13 @@ class DeepSeekV4DSparkAttention(nn.Module):
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_local_groups
+        # Optionally run the draft o-projection in BF16 (matching the DeepSeek
+        # reference) instead of FP8-quantizing both the activation and wo_a.
+        # FP8 noise in the o-proj compounds into the low-margin tail draft
+        # positions; the reference keeps inverse-RoPE + the wo_a einsum in BF16.
+        self._bf16_o_proj = os.environ.get("VLLM_DSPARK_BF16_O_PROJ", "0") == "1"
+        self._wo_a_bf16: torch.Tensor | None = None
+        self._bf16_o_proj_checked = False
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -300,6 +307,7 @@ class DeepSeekV4DSparkAttention(nn.Module):
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
         num_rejected_tokens: torch.Tensor | None = None,
+        slot_index: torch.Tensor | None = None,
     ) -> None:
         if main_x.shape[1] > self.window_size:
             main_x = main_x[:, -self.window_size :]
@@ -310,6 +318,15 @@ class DeepSeekV4DSparkAttention(nn.Module):
             main_positions.reshape(batch_size * seq_len),
         ).view(batch_size, seq_len, self.head_dim)
         slots = main_positions.to(torch.long).remainder(self.window_size)
+        slot_expand = slots.unsqueeze(-1).expand(-1, -1, self.head_dim)
+        # Bug 1: select the persistent cache rows for THIS step's requests by a
+        # stable per-request slot (req-id -> slot) rather than batch-row
+        # position. slot_index is None on the single-stream / identity-permutation
+        # fast path, which keeps the original leading-rows behavior byte-for-byte.
+        if slot_index is None:
+            cache_rows = self.main_kv_cache[:batch_size]
+        else:
+            cache_rows = self.main_kv_cache.index_select(0, slot_index)
         values = flat_kv
         if num_rejected_tokens is not None:
             rejected = num_rejected_tokens.to(
@@ -324,16 +341,16 @@ class DeepSeekV4DSparkAttention(nn.Module):
                 dtype=torch.long,
             ).view(1, seq_len)
             valid_mask = token_offsets < valid_lengths.view(batch_size, 1)
-            old_values = self.main_kv_cache[:batch_size].gather(
-                1,
-                slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
-            )
+            old_values = cache_rows.gather(1, slot_expand)
             values = torch.where(valid_mask.unsqueeze(-1), flat_kv, old_values)
-        self.main_kv_cache[:batch_size].scatter_(
-            1,
-            slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
-            values,
-        )
+        if slot_index is None:
+            self.main_kv_cache[:batch_size].scatter_(1, slot_expand, values)
+        else:
+            # index_copy_ on freshly gathered rows avoids aliasing on a
+            # permuted/advanced-indexed view (which would not be in-place) while
+            # preserving the rejection torch.where semantics exactly.
+            updated_rows = cache_rows.scatter(1, slot_expand, values)
+            self.main_kv_cache.index_copy_(0, slot_index, updated_rows)
 
     def _project_q_and_draft_kv(
         self,
@@ -361,9 +378,10 @@ class DeepSeekV4DSparkAttention(nn.Module):
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if store_main_kv:
-            self.store_main_kv(main_x, main_positions)
+            self.store_main_kv(main_x, main_positions, slot_index=slot_index)
 
         q, draft_kv = self._project_q_and_draft_kv(hidden_states, positions)
         q = q.view(batch_size, block_size, self.n_local_heads, self.head_dim)
@@ -374,15 +392,36 @@ class DeepSeekV4DSparkAttention(nn.Module):
             torch.full_like(current_positions, self.window_size),
         )
 
+        # Bug 1: read the cache rows that belong to THIS step's requests. On the
+        # identity fast-path (slot_index is None) we pass the buffer as-is so the
+        # kernel's batch_idx==row mapping is unchanged (byte-identical). When
+        # slots are permuted we materialize a contiguous [batch_size, ...] view
+        # via index_select so the kernel's batch_idx still lines up.
+        if slot_index is None:
+            main_kv_cache = self.main_kv_cache
+        else:
+            main_kv_cache = self.main_kv_cache.index_select(0, slot_index)
+
         out = dspark_sparse_attention(
             q,
             draft_kv,
-            self.main_kv_cache,
+            main_kv_cache,
             valid_main_lengths,
             self.attn_sink,
             self.softmax_scale,
             self.sparse_scores[:batch_size, :block_size],
         ).to(self.dtype)
+        if self._bf16_o_proj:
+            result = self._o_proj_bf16(out, positions)
+            if not self._bf16_o_proj_checked:
+                self._bf16_o_proj_checked = True
+                self._check_bf16_o_proj(out, positions, result)
+            return result
+        return self._o_proj_fp8(out, positions)
+
+    def _o_proj_fp8(
+        self, out: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
         out_fp8, out_scale = fused_inv_rope_fp8_quant(
             out,
             positions,
@@ -394,7 +433,7 @@ class DeepSeekV4DSparkAttention(nn.Module):
             tma_aligned_scales=self._tma_aligned_scales,
         )
         projected = torch.empty(
-            (batch_size * block_size, self.n_local_groups, self.o_lora_rank),
+            (out.shape[0], self.n_local_groups, self.o_lora_rank),
             dtype=self.dtype,
             device=out.device,
         )
@@ -408,6 +447,78 @@ class DeepSeekV4DSparkAttention(nn.Module):
             list(self._einsum_recipe),
         )
         return _linear_no_bias(self.wo_b, projected.flatten(1).to(self.dtype))
+
+    def _o_proj_bf16(
+        self, out: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        # Reference draft o-proj (inference_model.py:786-791): bf16 inverse-RoPE
+        # on the last rope_dim dims (interleaved, is_neox_style=False) then a bf16
+        # einsum with wo_a, then wo_b. No fp8 quant of activation or weight.
+        rd = self.rope_head_dim
+        half = rd // 2
+        cache = self.rotary_emb.cos_sin_cache.to(torch.float32)
+        cos = cache[positions, :half]  # [T, half]
+        sin = cache[positions, half:]  # [T, half]
+        o = out.to(torch.float32)  # [T, H, D]
+        t, h, _ = o.shape
+        x = o[..., -rd:].unflatten(-1, (half, 2))  # [T, H, half, 2]
+        xr = x[..., 0]
+        xi = x[..., 1]
+        c = cos.view(t, 1, half)
+        s = sin.view(t, 1, half)
+        # inverse rotation = multiply by conj(cos + i*sin)
+        yr = xr * c + xi * s
+        yi = xi * c - xr * s
+        rot = torch.stack((yr, yi), dim=-1).flatten(-2)  # [T, H, rd]
+        o = torch.cat((o[..., :-rd], rot), dim=-1)  # [T, H, D]
+        g = self.n_local_groups
+        a = o.reshape(t, g, (h // g) * o.shape[-1]).to(torch.bfloat16)  # [T, g, r]
+        wo_a = self._get_wo_a_bf16()  # [g, o_lora_rank, r]
+        projected = torch.einsum("tgr,gdr->tgd", a, wo_a)  # [T, g, o_lora_rank]
+        return _linear_no_bias(self.wo_b, projected.flatten(1).to(self.dtype))
+
+    def _get_wo_a_bf16(self) -> torch.Tensor:
+        if self._wo_a_bf16 is None:
+            w = self.wo_a.weight
+            sinv = getattr(self.wo_a, "weight_scale_inv", None)
+            wf = self._dequant_block_fp8(w, sinv) if sinv is not None else w
+            self._wo_a_bf16 = (
+                wf.to(torch.bfloat16)
+                .view(self.n_local_groups, self.o_lora_rank, -1)
+                .contiguous()
+            )
+        return self._wo_a_bf16
+
+    @staticmethod
+    def _dequant_block_fp8(
+        weight: torch.Tensor, scale_inv: torch.Tensor
+    ) -> torch.Tensor:
+        # Block fp8 dequant: weight [N,K] fp8, scale_inv [ceil(N/bn), ceil(K/bk)].
+        n, k = weight.shape
+        sn, sk = scale_inv.shape
+        bn = -(-n // sn)
+        bk = -(-k // sk)
+        scale = scale_inv.to(torch.float32)
+        scale = scale.repeat_interleave(bn, 0)[:n].repeat_interleave(bk, 1)[:, :k]
+        return (weight.to(torch.float32) * scale).to(torch.bfloat16)
+
+    def _check_bf16_o_proj(
+        self, out: torch.Tensor, positions: torch.Tensor, bf16_result: torch.Tensor
+    ) -> None:
+        # One-time sanity: the bf16 path should match the fp8 path up to fp8
+        # rounding (~1-5%). A large rel-diff means a layout bug (rope/einsum
+        # /dequant), not a precision improvement.
+        try:
+            ref = self._o_proj_fp8(out, positions)
+            num = (bf16_result.float() - ref.float()).norm()
+            den = ref.float().norm() + 1e-6
+            logger.info(
+                "DSpark BF16 o-proj self-check: rel-diff vs FP8 = %.4f "
+                "(~0.01-0.05 = fp8 rounding ok; >0.3 = layout bug)",
+                (num / den).item(),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("DSpark BF16 o-proj self-check failed: %s", e)
 
 
 class DeepSeekV4DSparkMarkovHead(nn.Module):
@@ -619,6 +730,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = x
         attn_in, post, comb = unpack_mhc_pre_outputs(
@@ -635,6 +747,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
             main_x=main_x,
             main_positions=main_positions,
             store_main_kv=store_main_kv,
+            slot_index=slot_index,
         )
         x = self.hc_post(attn_out.to(self.dtype), residual, post, comb).to(self.dtype)
 
@@ -723,7 +836,22 @@ class DeepSeekV4DSparkModel(nn.Module):
         main_hidden: torch.Tensor,
         main_positions: torch.Tensor,
         num_rejected_tokens: torch.Tensor | None = None,
+        slot_index: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> None:
+        if query_start_loc is not None:
+            # Bug 2 ragged path: main_hidden/main_positions are flat
+            # [total_rows, ...] with per-request segments given by
+            # query_start_loc; rows-per-request are NOT uniform (chunked-prefill
+            # mixed prefill+decode step). Runs eager.
+            self._prefill_main_ragged(
+                main_hidden,
+                main_positions,
+                query_start_loc,
+                num_rejected_tokens=num_rejected_tokens,
+                slot_index=slot_index,
+            )
+            return
         main_x = self.project_main(main_hidden.reshape(-1, main_hidden.shape[-1]))
         main_x = main_x.view(*main_hidden.shape[:-1], self.config.hidden_size)
         for layer in self.layers.values():
@@ -731,7 +859,57 @@ class DeepSeekV4DSparkModel(nn.Module):
                 main_x,
                 main_positions,
                 num_rejected_tokens=num_rejected_tokens,
+                slot_index=slot_index,
             )
+
+    def _prefill_main_ragged(
+        self,
+        main_hidden: torch.Tensor,
+        main_positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_rejected_tokens: torch.Tensor | None = None,
+        slot_index: torch.Tensor | None = None,
+    ) -> None:
+        """Store main-KV for a ragged batch, one request segment at a time.
+
+        Each request r occupies rows [query_start_loc[r], query_start_loc[r+1])
+        of the flat inputs. We project and window-store each segment into its
+        own persistent cache slot independently, so per-request row counts may
+        differ (the rectangular [B, seq, H] fast-path cannot represent this).
+        """
+        flat_hidden = main_hidden.reshape(-1, main_hidden.shape[-1])
+        main_x = self.project_main(flat_hidden)
+        flat_positions = main_positions.reshape(-1)
+        starts = query_start_loc.to(torch.long).tolist()
+        batch_size = len(starts) - 1
+        # Each segment is a 1-request store, so it must carry an EXPLICIT
+        # single-row slot (the request's persistent cache row) — never None,
+        # which store_main_kv would interpret as "leading row 0" and collapse
+        # every request onto row 0. On the identity permutation (slot_index is
+        # None) request r owns row r.
+        for req_index in range(batch_size):
+            start = starts[req_index]
+            end = starts[req_index + 1]
+            if end <= start:
+                continue
+            seg_x = main_x[start:end].unsqueeze(0)
+            seg_positions = flat_positions[start:end].unsqueeze(0)
+            seg_rejected = None
+            if num_rejected_tokens is not None:
+                seg_rejected = num_rejected_tokens[req_index : req_index + 1]
+            if slot_index is None:
+                seg_slot = torch.tensor(
+                    [req_index], dtype=torch.long, device=main_x.device
+                )
+            else:
+                seg_slot = slot_index[req_index : req_index + 1]
+            for layer in self.layers.values():
+                layer.attn.store_main_kv(
+                    seg_x,
+                    seg_positions,
+                    num_rejected_tokens=seg_rejected,
+                    slot_index=seg_slot,
+                )
 
     def draft(
         self,
@@ -744,6 +922,7 @@ class DeepSeekV4DSparkModel(nn.Module):
         return_logits: bool = True,
         return_confidence: bool = True,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = input_ids.shape[0]
         block_size = self.block_size
@@ -787,6 +966,7 @@ class DeepSeekV4DSparkModel(nn.Module):
                 main_x=main_x,
                 main_positions=main_positions,
                 store_main_kv=store_main_kv,
+                slot_index=slot_index,
             )
 
         final_layer = self.layers[self.stage_layer_keys[-1]]
@@ -903,11 +1083,15 @@ class DeepSeekV4DSpark(nn.Module):
         main_hidden: torch.Tensor,
         main_positions: torch.Tensor,
         num_rejected_tokens: torch.Tensor | None = None,
+        slot_index: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> None:
         self.model.prefill_main(
             main_hidden,
             main_positions,
             num_rejected_tokens=num_rejected_tokens,
+            slot_index=slot_index,
+            query_start_loc=query_start_loc,
         )
 
     def draft(
@@ -917,6 +1101,7 @@ class DeepSeekV4DSpark(nn.Module):
         main_positions: torch.Tensor,
         *,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         draft_ids, _logits, confidence = self.model.draft(
             input_ids,
@@ -925,6 +1110,7 @@ class DeepSeekV4DSpark(nn.Module):
             self.lm_head,
             self.logits_processor,
             store_main_kv=store_main_kv,
+            slot_index=slot_index,
         )
         self._last_confidence = confidence
         return draft_ids
@@ -938,6 +1124,7 @@ class DeepSeekV4DSpark(nn.Module):
         return_logits: bool = True,
         return_confidence: bool = True,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         try:
             draft_ids, logits, confidence = self.model.draft(
@@ -949,6 +1136,7 @@ class DeepSeekV4DSpark(nn.Module):
                 return_logits=return_logits,
                 return_confidence=return_confidence,
                 store_main_kv=store_main_kv,
+                slot_index=slot_index,
             )
         except BaseException as _e:  # noqa: BLE001 - diagnostic unmask
             import traceback as _tb
