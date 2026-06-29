@@ -147,15 +147,20 @@ The original DSpark serving path forced single-request processing (two bugs, dia
 
 Validated: under sustained load (2 long requests always in flight + constant short finishers forcing condense), acceptance held at **4.19** (vs 4.52 single-stream), **zero incoherent/errored outputs**, no `ValueError`; single-stream speed unchanged.
 
-### High-context (`BT_COPY_TRIM`, `INDEXER_PT_TRIM`)
-At large `--max-model-len`, per-step block-table structures are sized by `cdiv(max_model_len, block_size)` regardless of live context. `VLLM_DSPARK_BT_COPY_TRIM=1` (default on) trims the expansion **copy** to live context (needle-validated to 120k). The 1M config is still ~25% slower than 262k at fixed context because the **indexer hands the full page-table width to the b12x topk kernel** (1024 cols @262k vs 4096 @1M, a clean 4×).
+### High-context: 1M decode (`BT_COPY_TRIM`, `INDEXER_PT_CAP`)
+At large `--max-model-len`, per-step block-table structures are sized by `cdiv(max_model_len, block_size)` regardless of live context. `VLLM_DSPARK_BT_COPY_TRIM=1` (default on) trims the expansion **copy** to live context (needle-validated to 120k).
 
-`VLLM_DSPARK_INDEXER_PT_TRIM=1` (experimental, **default off**) trims that width — **but as written it breaks FULL-cudagraph capture** (`cudaErrorStreamCaptureInvalidated`): the per-step `.contiguous()` trim produces a data-dependent shape inside the captured decode graph. **Do not enable it under FULL cudagraph.** A correct fix needs a cudagraph-stable redesign (fixed-width pre-allocated buffer). More fundamentally the page-table width is tied to *max addressable context*, so this is largely the **inherent cost of 1M addressability**: set `--max-model-len` to the smallest value that covers your context (262k → ~262 tok/s; use 1M only when you truly need >262k → ~196, still above the 181 bench).
+**1M interactive decode = ~238 tok/s** (single stream, code; clears the 230 target) at full 1.1M-token KV. The 262k config is ~262 — the ~10–13% gap is **structural**: the compiled b12x decode kernel (`sparse_mla_decode_forward`) does per-step work proportional to the KV pool's `num_blocks` (~4260 @1M vs ~2500 @262k). We proved this isn't fixable from Python:
+- `VLLM_DSPARK_INDEXER_PT_CAP=<tokens>` (default `0`/off) — a **cudagraph-stable** cap that pins the indexer page-table to a fixed `cdiv(CAP, block)` width (eager fallback for contexts > CAP). Capture succeeds and a needle retrieves correctly below and above CAP — **but it is throughput-neutral** (capping to the 262k-equivalent width recovered 0%), confirming the indexer page-table is *not* the bottleneck. Left in, off by default; it also forces >CAP requests eager, so don't enable it for a true-1M workload.
+- `--block-size 512` (to halve `num_blocks`) is **unsupported** — the b12x kernels hardcode 256 (`setStorage ... out of bounds`).
+- The KV pool can't shrink without losing the 1M ceiling, and b12x ships compiled (no source). So 238 is the 1M interactive ceiling on this box; closing the rest needs a b12x-kernel change upstream.
+
+Note: a *saturated back-to-back* throughput pattern reads lower (~227) because the next request's chunked prefill overlaps and steals decode windows — that's a serving-throughput artifact, not the interactive decode rate.
 
 ### Env flags added this round
 - `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1` — enable the ragged concurrency path.
 - `VLLM_DSPARK_BT_COPY_TRIM` (default `1`) — trim per-step block-table copy to live context.
-- `VLLM_DSPARK_INDEXER_PT_TRIM` (default `0`, experimental — **breaks FULL cudagraph**, see above) — trim indexer page-table width.
+- `VLLM_DSPARK_INDEXER_PT_CAP` (default `0`/off) — cudagraph-stable indexer page-table cap (tokens); throughput-neutral here, see above. Don't enable for true-1M workloads (forces >CAP requests eager).
 - `VLLM_DSPARK_BF16_O_PROJ` (default `0`) — bf16 draft o-proj (matches reference; measured throughput-neutral).
 
 See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for the people and projects this builds on.

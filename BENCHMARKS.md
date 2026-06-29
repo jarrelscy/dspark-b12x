@@ -68,3 +68,9 @@ Sustained 2-in-flight + short finishers (forces batch condense): accept_len **4.
 
 ### Measurement caveat
 Client-side streaming **inflates** decode rate (spec-decode token bursts buffer on the client → compressed inter-token window); differential timing **deflates** it (prefix-cache asymmetry). Trust the server `Avg generation throughput`.
+
+## 1M-context decode (default config)
+Single-stream interactive decode, code workload, `--max-model-len 1048576` (1.10M-token KV):
+- **DSpark @ 1M: ~238 tok/s** (236–240, stable) — clears 230; vs 262k config ~262.
+- The ~10–13% gap is a compiled b12x decode-kernel cost ∝ KV `num_blocks`; not fixable from Python (indexer page-table cap = 0% recovery; block_size 512 unsupported; KV can't shrink). 238 is the 1M interactive ceiling on this box.
+- Saturated back-to-back load reads ~227 (next request's chunked prefill steals decode windows — serving-throughput artifact, not interactive rate).

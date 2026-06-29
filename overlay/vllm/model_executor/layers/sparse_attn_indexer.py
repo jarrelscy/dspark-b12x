@@ -822,40 +822,21 @@ def sparse_attn_indexer(
             # so .contiguous() here was a guaranteed no-op per decoded token.
             seq_lens = b12x_seq_lens[:num_decode_tokens]
             block_table = b12x_block_table[:num_decode_tokens]
-            # DIAG (VLLM_DSPARK_INDEXER_PT_TRIM): b12x_block_table.shape[1] is the
-            # full cdiv(max_model_len, block_size) page-table stride. Only dim 0
-            # (tokens) is sliced above; the column count stays pinned to the
-            # max-model-len capacity even though the live compressed context
-            # (active_width) is tiny. That full width flows into
-            # plan_indexer_scratch(max_page_table_width=block_table.shape[1]) and
-            # into the compiled index_topk_fp8 kernel as its page-table extent.
-            # It is the ONLY per-step indexer input that scales with the
-            # --max-model-len CONFIG (1024 cols @262k vs 4096 @1M, block_size=256;
-            # active_width is identical ~227 at both). Trim the column count to the
-            # live page-table width (active_width K-rows -> pages, + slack) so the
-            # scratch plan and kernel page-table extent track live context, not the
-            # config cap. Column-slicing breaks contiguity -> .contiguous() copy
-            # (cheap: trimmed width is small). Default OFF; set
-            # VLLM_DSPARK_INDEXER_PT_TRIM=1 to enable (A/B against current).
-            if os.environ.get("VLLM_DSPARK_INDEXER_PT_TRIM", "0").strip().lower() in {
-                "1", "true", "yes", "on"
-            }:
-                aw_t = decode_metadata.active_width
-                full_pt_w = int(block_table.shape[1])
-                if aw_t is not None:
-                    # active_width is in indexer K-rows (already compressed); the
-                    # b12x paged index cache page size is 64 rows/page.
-                    live_pt_w = max(
-                        1,
-                        -(-int(aw_t.item()) // _B12X_PAGED_INDEX_PAGE_SIZE) + 1,
-                    )
-                    live_pt_w = min(live_pt_w, full_pt_w)
-                    if live_pt_w < full_pt_w:
-                        block_table = block_table[:, :live_pt_w].contiguous()
             topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
             # b12x consumes indexer K-row metadata. DSV4/C4 seq_lens and
             # active_width have already been compressed by the metadata builder;
             # GLM passes one K row per context token.
+            #
+            # PERF (VLLM_DSPARK_INDEXER_PT_CAP): block_table.shape[1] feeds
+            # plan_indexer_scratch(max_page_table_width=...) and the b12x
+            # index_topk_fp8 kernel's page-table extent -- the only per-step indexer
+            # input that scales with the --max-model-len CONFIG (live scan is
+            # active_width-bounded). When the cap is set, the metadata builder has
+            # already swapped decode_metadata.block_table for a FIXED-width
+            # cdiv(CAP, block) buffer (cudagraph-stable) for batches whose context
+            # fits the cap; over-CAP steps are forced eager by the runner and keep
+            # the full-width buffer. Nothing extra to do here -- just consume the
+            # (possibly capped) block_table the builder produced.
             _run_b12x_paged_topk(
                 q_fp8=q_quant[:num_decode_tokens].contiguous(),
                 weights=weights[:num_decode_tokens].contiguous(),

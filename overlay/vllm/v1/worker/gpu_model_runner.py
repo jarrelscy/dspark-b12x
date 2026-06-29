@@ -735,6 +735,17 @@ class GPUModelRunner(
         self.optimistic_seq_lens_cpu = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, pin_memory=self.pin_memory
         )
+        # PT-CAP: cap (model tokens) for the b12x sparse-indexer decode page-table
+        # width. >0 forces decode steps whose live max context exceeds the cap to
+        # run eager (see _determine_batch_execution_and_padding); <=0 disables.
+        import os as _os
+
+        try:
+            self._indexer_pt_cap_tokens = int(
+                _os.environ.get("VLLM_DSPARK_INDEXER_PT_CAP", "0").strip()
+            )
+        except ValueError:
+            self._indexer_pt_cap_tokens = 0
         self.num_computed_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -3859,6 +3870,20 @@ class GPUModelRunner(
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+
+        # PT-CAP (VLLM_DSPARK_INDEXER_PT_CAP): the b12x sparse-indexer decode path
+        # captures FULL cudagraphs whose page-table width is fixed at
+        # cdiv(CAP, block). Those captured graphs are only correct for batches whose
+        # context fits the cap; a step whose live max context exceeds CAP needs the
+        # full-width (uncapped) indexer page-table, which is a different shape than
+        # the captured one. Force such steps eager (CUDAGraphMode.NONE) so the
+        # builder hands back the full-width block_table and no shape-mismatched
+        # captured graph is replayed. Host-side bound (no D2H sync), mirroring the
+        # builder's seq_lens_cpu_upper_bound gate; disabled (cap<=0) => no effect.
+        if self._indexer_pt_cap_tokens > 0 and num_reqs > 0 and not force_eager:
+            live_max_seq_ub = int(self.optimistic_seq_lens_cpu[:num_reqs].max())
+            if live_max_seq_ub > self._indexer_pt_cap_tokens:
+                force_eager = True
 
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
             return self.cudagraph_dispatcher.dispatch(

@@ -31,6 +31,23 @@ _B12X_PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
 _B12X_PAGED_INDEX_TILE_BLOCK_K = 512
 
 
+def _indexer_pt_cap_tokens() -> int:
+    # Cap (in model context tokens) for the b12x sparse-indexer decode
+    # page-table width. <=0 / unset disables the cap (full max_model_len width,
+    # byte-identical to prior behavior). When set below max_model_len, decode
+    # steps whose batch-max context is <= CAP run on a fixed cdiv(CAP, block)
+    # page-table width (cudagraph-stable); steps above CAP run eager full-width.
+    raw = os.environ.get("VLLM_DSPARK_INDEXER_PT_CAP", "0")
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return 0
+
+
+def indexer_pt_cap_tokens() -> int:
+    return _indexer_pt_cap_tokens()
+
+
 def _bt_copy_trim_enabled() -> bool:
     # Cap the per-step block-table expansion copy at the batch's live block count
     # instead of the full cdiv(max_model_len, block_size) row stride. Default ON;
@@ -368,8 +385,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        self.max_model_len = int(self.vllm_config.model_config.max_model_len)
         max_num_blocks_per_req = cdiv(
-            self.vllm_config.model_config.max_model_len,
+            self.max_model_len,
             self.kv_cache_spec.block_size * get_total_cp_world_size(),
         )
         self.expanded_block_table_buffer = torch.zeros(
@@ -380,6 +398,41 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+
+        # PERF (VLLM_DSPARK_INDEXER_PT_CAP): the b12x sparse-indexer decode top-k
+        # plans its scratch from, and walks a page-table of width,
+        # block_table.shape[1] = cdiv(max_model_len, block_size). That is the only
+        # per-step indexer cost that scales with the --max-model-len CONFIG (live
+        # scan is active_width-bounded). When a positive CAP (in model tokens) is
+        # set and CAP < max_model_len, build() hands the b12x decode path a
+        # block_table of FIXED width cdiv(CAP, block_size) (a compile-time constant
+        # => cudagraph-stable scratch + page-table extent) instead of the full
+        # max_model_len width. We copy the live leading columns into a persistent
+        # fixed-width buffer each build (fixed dst shape, so capture-safe). Requests
+        # whose context exceeds CAP cannot be served from the capped columns and
+        # MUST run eager on the full-width buffer; the runner detects max_seq_len >
+        # CAP (host-side, pre-dispatch) and forces CUDAGraphMode.NONE for that step,
+        # where build() falls back to the full buffer. Unset/0 => disabled (the
+        # full-width buffer is always used; byte-identical to prior behavior).
+        self.pt_cap_tokens = _indexer_pt_cap_tokens()
+        self.pt_cap_block_width = 0
+        self.capped_block_table_buffer: torch.Tensor | None = None
+        if 0 < self.pt_cap_tokens < self.max_model_len:
+            self.pt_cap_block_width = cdiv(
+                self.pt_cap_tokens,
+                self.kv_cache_spec.block_size * get_total_cp_world_size(),
+            )
+            if self.pt_cap_block_width < max_num_blocks_per_req:
+                self.capped_block_table_buffer = torch.zeros(
+                    (
+                        scheduler_config.max_num_batched_tokens,
+                        self.pt_cap_block_width,
+                    ),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            else:
+                self.pt_cap_block_width = 0
 
         # See: DeepGMM/csrc/apis/attention.hpp
         self.scheduler_metadata_buffer = torch.empty(
@@ -909,6 +962,48 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # kernels see the same (B, next_n) layout as the MTP path.
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
+
+            # PT-CAP: hand the b12x decode path a FIXED-width page-table when the
+            # cap is active and the batch fits (<= CAP). The capped buffer's column
+            # count cdiv(CAP, block) is a compile-time constant, so the scratch plan
+            # and kernel page-table extent it derives are cudagraph-stable. Over-CAP
+            # steps are forced eager by the runner (CUDAGraphMode.NONE) and keep the
+            # full-width block_table here. We gate on an UPPER BOUND of the batch max
+            # seq_len (host-side, no D2H sync) and only narrow when the live pages
+            # provably fit in the capped columns; otherwise we keep full width so a
+            # mis-dispatched over-CAP step is still correct (just slower), never
+            # truncated. Only the b12x indexer path is capped; the DeepGEMM/XPU
+            # fallback continues to consume the full-width block_table.
+            if (
+                envs.VLLM_USE_B12X_SPARSE_INDEXER
+                and self.capped_block_table_buffer is not None
+                and not requires_padding
+            ):
+                seq_lens_cpu_ub = common_attn_metadata.seq_lens_cpu_upper_bound
+                if seq_lens_cpu_ub is not None and num_decodes > 0:
+                    live_max_seq_cap = int(seq_lens_cpu_ub[:num_decodes].max())
+                else:
+                    live_max_seq_cap = int(common_attn_metadata.max_seq_len)
+                # Live page-table columns consumed. The expanded_block_table_buffer
+                # (and the input block_table) are indexed in block_size pages
+                # (its width is cdiv(max_model_len, block_size * cp)), so measure
+                # live pages in the SAME unit -- not storage_block_size, which is a
+                # different (compressed-row) unit that bt_copy_width over-estimates
+                # then clamps. +1 slack page for the last partial block. Use the
+                # capped buffer only when those pages provably fit its columns.
+                block_pages_unit = (
+                    self.kv_cache_spec.block_size * get_total_cp_world_size()
+                )
+                live_pages = cdiv(live_max_seq_cap, block_pages_unit) + 1
+                if (
+                    live_max_seq_cap <= self.pt_cap_tokens
+                    and live_pages <= self.pt_cap_block_width
+                    and block_table.shape[1] >= self.pt_cap_block_width
+                ):
+                    bt_rows = block_table.shape[0]
+                    capped = self.capped_block_table_buffer[:bt_rows]
+                    capped.copy_(block_table[:, : self.pt_cap_block_width])
+                    block_table = capped
 
             if envs.VLLM_USE_B12X_SPARSE_INDEXER:
                 schedule_metadata = self._maybe_build_b12x_schedule_metadata(

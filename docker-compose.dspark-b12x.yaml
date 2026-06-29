@@ -57,11 +57,11 @@ services:
       - VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1
       # High-context: trim the per-step block-table expansion copy to live ctx.
       - VLLM_DSPARK_BT_COPY_TRIM=1
-      # EXPERIMENTAL & BROKEN under FULL cudagraph: trims the indexer page-table
-      # width to the b12x topk kernel, but the per-step .contiguous() invalidates
-      # cudagraph capture (cudaErrorStreamCaptureInvalidated). Needs a cudagraph-
-      # stable redesign. Do NOT enable here. Left documented in the README.
-      # - VLLM_DSPARK_INDEXER_PT_TRIM=1
+      # Cudagraph-stable indexer page-table cap (tokens). Capture-safe + needle-
+      # correct, but THROUGHPUT-NEUTRAL (the indexer page-table isn't the 1M
+      # bottleneck; that's a compiled-kernel num_blocks cost). Off by default; do
+      # NOT enable for true-1M workloads (forces >CAP requests to slow eager). See README.
+      # - VLLM_DSPARK_INDEXER_PT_CAP=262144
     command:
       - "bash"
       - "-lc"
@@ -77,7 +77,7 @@ services:
         --trust-remote-code
         --kv-cache-dtype fp8 --block-size 256 --load-format safetensors
         --tensor-parallel-size 2 --moe-backend b12x --linear-backend b12x
-        --gpu-memory-utilization 0.93 --max-model-len 262000 --max-num-seqs 4
+        --gpu-memory-utilization 0.93 --max-model-len 1048576 --max-num-seqs 4
         --async-scheduling --no-scheduler-reserve-full-isl
         --max-num-batched-tokens 4096 --max_cudagraph_capture_size 256
         --attention-backend B12X_MLA_SPARSE --enable-chunked-prefill --enable-prefix-caching
