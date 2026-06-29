@@ -1,0 +1,94 @@
+# DeepSeek-V4-Flash + DSpark speculative decoding on the B12X SM120 stack.
+#
+# This serves the DeepSeek-V4-Flash-DSpark checkpoint with method=dspark (block
+# speculative drafting) running through b12x's custom SM120 kernels (FP8 GEMM,
+# MoE, sparse-MLA, PCIe one-shot all-reduce) on 2x RTX PRO 6000 (sm120, TP2).
+#
+# It overlays a DSpark-patched copy of the image's vLLM (./overlay/vllm) over the
+# image's install, and replaces tilelang's libcudart stub with the real libcudart
+# (see README "Setup"). The b12x compiled .so are kept from the image.
+#
+# Prereqs created by setup.sh:  ./vllm-patched/  and  ./libcudart.so.13
+services:
+  dspark-b12x:
+    image: voipmonitor/vllm:chthonic-consecration-f1190eab-b12x0ff2847-pr20-cu132
+    environment:
+      - VLLM_API_KEY=${VLLM_API_KEY:-}
+      - HF_HOME=/data/huggingface
+      - HF_HUB_OFFLINE=1
+      - CUTE_DSL_ARCH=sm_120a
+      - NCCL_IB_DISABLE=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - VLLM_USE_AOT_COMPILE=1
+      # COMPILE path: target is compiled + cudagraphed; the DSpark draft runs
+      # eager (its tilelang heads can't be torch.compiled or captured). This is
+      # the fast, coherent config. VLLM_USE_BREAKABLE_CUDAGRAPH=1 corrupts the
+      # draft -> garbage; --enforce-eager is coherent but ~9 tok/s. So keep 0.
+      - VLLM_USE_BREAKABLE_CUDAGRAPH=0
+      - VLLM_USE_MEGA_AOT_ARTIFACT=1
+      - VLLM_MEMORY_PROFILE_INCLUDE_ATTN=1
+      - VLLM_USE_FLASHINFER_SAMPLER=1
+      - VLLM_USE_B12X_WO_PROJECTION=1
+      - VLLM_USE_B12X_MHC=1
+      - VLLM_USE_B12X_FP8_GEMM=1
+      - VLLM_USE_B12X_MOE=1
+      - VLLM_USE_B12X_SPARSE_INDEXER=1
+      # DSpark imports tilelang, whose libcudart_stub.so shadows the real
+      # libcudart at import (missing cudaDeviceReset, which flashinfer.comm
+      # needs). Preload the real CUDA 13.2 libcudart so its symbols win.
+      - LD_PRELOAD=/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcudart.so.13
+      # DSpark's proposer lives in the V1 model runner; b12x's V2 runner only
+      # supports eagle3/dflash spec methods. b12x kernels still engage under V1.
+      - VLLM_USE_V2_MODEL_RUNNER=0
+      - VLLM_PCIE_ALLREDUCE_BACKEND=b12x
+      - VLLM_ENABLE_PCIE_ALLREDUCE=1
+      - B12X_MLA_SM120_UNIFIED=1
+      - B12X_DENSE_SPLITK_TURBO=1
+      - B12X_W4A16_TC_DECODE=1
+      - VLLM_DSPARK_CONFIDENCE_SCHEDULER=off
+      - VLLM_DSPARK_LOCAL_ARGMAX=0
+      - VLLM_DSPARK_REPLICATE_MARKOV_W1=0
+      # QAT parity: model trained with FP8-quantized KV; reference always
+      # quant-dequants KV. (Measured neutral on V4-Flash, but matches training.)
+      - VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT=1
+    command:
+      - "bash"
+      - "-lc"
+      # The image bakes NCCL_GRAPH_FILE= (empty) which NCCL tries to open as an
+      # XML topology and dies ("unhandled system error"); unset it. The baked
+      # serve script's relative .venv path is broken in this image layout, so
+      # call /opt/venv/bin/vllm directly.
+      - >
+        unset NCCL_GRAPH_FILE NCCL_GRAPH_DUMP_FILE VLLM_B12X_MLA_EXTEND_MAX_CHUNKS;
+        exec /opt/venv/bin/vllm serve deepseek-ai/DeepSeek-V4-Flash-DSpark
+        --served-model-name deepseek/v4flashdspark
+        --host 0.0.0.0 --port 8001
+        --trust-remote-code
+        --kv-cache-dtype fp8 --block-size 256 --load-format safetensors
+        --tensor-parallel-size 2 --moe-backend b12x --linear-backend b12x
+        --gpu-memory-utilization 0.93 --max-model-len 16384 --max-num-seqs 4
+        --async-scheduling --no-scheduler-reserve-full-isl
+        --max-num-batched-tokens 4096 --max_cudagraph_capture_size 256
+        --attention-backend B12X_MLA_SPARSE --enable-chunked-prefill --enable-prefix-caching
+        --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice
+        --reasoning-parser deepseek_v4 --enable-flashinfer-autotune
+        --speculative-config '{"method":"dspark","model":"deepseek-ai/DeepSeek-V4-Flash-DSpark","num_speculative_tokens":5}'
+    ports:
+      - "0.0.0.0:8001:8001"
+    volumes:
+      - /data/huggingface:/data/huggingface
+      - ./triton_cache:/data/triton_cache
+      # DSpark-patched vLLM (overlay applied) over the image's install; keeps the
+      # image's compiled b12x .so. Build ./vllm-patched with setup.sh.
+      - ./vllm-patched:/opt/venv/lib/python3.12/site-packages/vllm
+      # Real libcudart over tilelang's stub (see README).
+      - ./libcudart.so.13:/opt/venv/lib/python3.12/site-packages/tilelang/lib/libcudart_stub.so:ro
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 2
+              capabilities: [gpu]
+    restart: unless-stopped
