@@ -57,8 +57,10 @@ services:
       - VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1
       # High-context: trim the per-step block-table expansion copy to live ctx.
       - VLLM_DSPARK_BT_COPY_TRIM=1
-      # EXPERIMENTAL: also trim the indexer page-table width handed to the b12x
-      # topk kernel (recovers some 1M-config decode speed). Default off; A/B it.
+      # EXPERIMENTAL & BROKEN under FULL cudagraph: trims the indexer page-table
+      # width to the b12x topk kernel, but the per-step .contiguous() invalidates
+      # cudagraph capture (cudaErrorStreamCaptureInvalidated). Needs a cudagraph-
+      # stable redesign. Do NOT enable here. Left documented in the README.
       # - VLLM_DSPARK_INDEXER_PT_TRIM=1
     command:
       - "bash"

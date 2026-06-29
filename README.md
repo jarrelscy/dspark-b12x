@@ -148,12 +148,14 @@ The original DSpark serving path forced single-request processing (two bugs, dia
 Validated: under sustained load (2 long requests always in flight + constant short finishers forcing condense), acceptance held at **4.19** (vs 4.52 single-stream), **zero incoherent/errored outputs**, no `ValueError`; single-stream speed unchanged.
 
 ### High-context (`BT_COPY_TRIM`, `INDEXER_PT_TRIM`)
-At large `--max-model-len`, per-step block-table structures are sized by `cdiv(max_model_len, block_size)` regardless of live context. `VLLM_DSPARK_BT_COPY_TRIM=1` (default on) trims the expansion **copy** to live context (needle-validated to 120k). The 1M config is still ~25% slower than 262k at fixed context because the **indexer hands the full page-table width to the b12x topk kernel**; `VLLM_DSPARK_INDEXER_PT_TRIM=1` (experimental, default off) trims that too — A/B it at your context.
+At large `--max-model-len`, per-step block-table structures are sized by `cdiv(max_model_len, block_size)` regardless of live context. `VLLM_DSPARK_BT_COPY_TRIM=1` (default on) trims the expansion **copy** to live context (needle-validated to 120k). The 1M config is still ~25% slower than 262k at fixed context because the **indexer hands the full page-table width to the b12x topk kernel** (1024 cols @262k vs 4096 @1M, a clean 4×).
+
+`VLLM_DSPARK_INDEXER_PT_TRIM=1` (experimental, **default off**) trims that width — **but as written it breaks FULL-cudagraph capture** (`cudaErrorStreamCaptureInvalidated`): the per-step `.contiguous()` trim produces a data-dependent shape inside the captured decode graph. **Do not enable it under FULL cudagraph.** A correct fix needs a cudagraph-stable redesign (fixed-width pre-allocated buffer). More fundamentally the page-table width is tied to *max addressable context*, so this is largely the **inherent cost of 1M addressability**: set `--max-model-len` to the smallest value that covers your context (262k → ~262 tok/s; use 1M only when you truly need >262k → ~196, still above the 181 bench).
 
 ### Env flags added this round
 - `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1` — enable the ragged concurrency path.
 - `VLLM_DSPARK_BT_COPY_TRIM` (default `1`) — trim per-step block-table copy to live context.
-- `VLLM_DSPARK_INDEXER_PT_TRIM` (default `0`, experimental) — trim indexer page-table width.
+- `VLLM_DSPARK_INDEXER_PT_TRIM` (default `0`, experimental — **breaks FULL cudagraph**, see above) — trim indexer page-table width.
 - `VLLM_DSPARK_BF16_O_PROJ` (default `0`) — bf16 draft o-proj (matches reference; measured throughput-neutral).
 
 See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for the people and projects this builds on.
