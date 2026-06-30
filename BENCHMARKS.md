@@ -1,76 +1,67 @@
-# Benchmarks — DSpark vs MTP on b12x (2× RTX PRO 6000, TP2, single stream, greedy)
+# Benchmarks — DSpark vs MTP on b12x (2× RTX PRO 6000 Blackwell, sm120, TP2)
 
-All numbers: vLLM `0.11.2.dev279` b12x image, DeepSeek-V4-Flash(-DSpark) FP8,
-`--temperature 0`, warmed (tilelang JIT + cudagraphs captured), `max_tokens≈256`.
-Throughput is decode tok/s. **Acceptance is content-dependent** (technical/code
-high, creative low), so single-number averages hide a wide spread — see per-prompt.
+Single stream, greedy (`temperature=0`), warmed (tilelang JIT + cudagraphs captured). Harness + prompts in [`benchmarks/`](benchmarks/).
+
+## Methodology
+- **Decode tok/s = server-side** `Avg generation throughput` over pure-decode windows (`Avg prompt throughput: 0.0`, `Running: 1`). Speculative decoding emits tokens in *bursts*, so client-side SSE timing **inflates** the rate and prefix-cache-asymmetric differential timing **deflates** it — trust the engine log. Client-side end-to-end runs ~10–15% below server-side (detok + SSE + HTTP + async-step).
+- **Acceptance is content-dependent** (code/structured ~4.5–4.8, reasoning ~3.3, creative ~2.2), and acceptance drives throughput — single-number averages hide a wide spread.
 
 ## Acceptance (per-position, mean accepted length out of block=5)
-
 | Config | pos0 | pos1 | pos2 | pos3 | pos4 | mean |
 |---|---|---|---|---|---|---|
 | MTP (num_spec=2) | 0.787 | 0.439 | — | — | — | 2.2 |
 | DSpark — initial port | 0.73 | 0.46 | 0.29 | 0.23 | 0.15 | 2.86 |
-| **DSpark — RoPE fix** | **0.80** | **0.61** | **0.37** | **0.27** | **0.19** | **3.24** |
+| **DSpark — after RoPE fix** | **0.80** | **0.61** | **0.37** | **0.27** | **0.19** | **3.24** |
 
-DSpark holds acceptance **much deeper** into the block than MTP (MTP collapses
-after pos1; cf. MTP num_spec=5 control: 0.787/0.42/0.12/0.03/0.006). After the
-RoPE fix, DSpark's pos-0 (0.80) also exceeds MTP's (0.787) — the trained block
-drafter behaving correctly. Observed acceptance windows ranged 2.6–4.3 by content.
+These are *broad-mix* numbers; on code the block fills much deeper (accept_len ~4.5–4.8). DSpark holds acceptance far deeper into the block than MTP (MTP num_spec=5 control collapses: 0.787/0.42/0.12/0.03/0.006). The RoPE fix lifted pos-0 above MTP's — the trained block drafter behaving correctly.
 
-## Throughput — identical 8-prompt broad benchmark
+## Decode throughput (server-side), vs the localmaxxing MTP run (181 tok/s)
+| workload | context | config | **DSpark tok/s** | accept | MTP tok/s |
+|---|---|---|---|---|---|
+| code / structured | ~29k | 262k | **~262** (257–278) | 4.5 | ~208 |
+| code / structured | ~82k | 262k | ~237 | 4.8 | — |
+| reasoning (think=high) | 37k | 262k | ~187 (160–215) | 3.3 | 181 (the bench) |
+| code / structured | ~29k | **1M** | **~238** (interactive) | 4.5 | — |
+| jasl FP8, no spec decode | — | 1M | ~82 | — | — |
 
-essay / photosynthesis / dragon-story / Hamlet / neural-net / water-cycle / python-sort / quantum
+- **DSpark beats MTP by ~26% on identical code prompts** (262 vs 208) and clears the 181 leaderboard run.
+- On reasoning the gap narrows (acceptance is content-bound); DSpark ~187 still edges the 181 bench.
+- ~2× the no-spec jasl FP8 baseline (~82).
 
-| Config | per-prompt tok/s | AVG | min | max |
+## Context-depth sweep — prefill tok/s, TTFT, decode (client-side, code content)
+Decode here is client-side end-to-end (~10–15% under server-side), so read the **trend**, not the absolute.
+
+| context | TTFT | prefill tok/s | decode tok/s (262k cfg) | decode tok/s (1M cfg) |
 |---|---|---|---|---|
-| **DSpark + RoPE fix** (16k ctx) | 140 210 132 154 159 181 **234** 154 | **168** | 129 | **234** |
-| MTP (1M ctx) | 98 144 140 155 150 152 176 155 | 146 | 98 | 176 |
-| MTP (200k ctx, 3-prompt) | 172 / 193 / 157 | ~175 | — | 194 |
+| ~4k | <1 s | ~5–6k | 234 | 203 |
+| ~32k | ~5 s | ~6,100 | 244 | 203 |
+| ~128k | ~25 s | ~5,200 | 225 | 191 |
+| ~240k / 598k | ~57 s / ~3 min | ~4,300 / ~3,100 | 209 (240k) | 146 (598k) |
+| ~942k | ~6.5 min | ~2,400 | — | ~129 |
 
-Notes:
-- **DSpark wins the head-to-head** at these settings and is strongest on
-  technical/structured content (python-sort 234, photosynthesis 210, water-cycle 181).
-- Context matters for MTP: at 1M ctx MTP averages 146 (larger KV/cudagraph
-  overhead); at 200k it was ~175. DSpark here is at 16k (raise via `--max-model-len`;
-  expect some slowdown at very large contexts, same as MTP).
-- Baseline jasl FP8 (no spec decode) on the same box: ~82 tok/s. Both b12x spec
-  paths roughly **2×** that.
+- **Prefill tok/s** peaks ~6k around 32k (tiny prompts are overhead-bound, very deep prompts attention-bound), declining with depth.
+- **TTFT** is prefill-dominated: sub-second at 4k → minutes near 1M.
+- **Decode falls with real context depth** in both configs (attention over a deeper KV per step).
+
+## The 1M "reservation tax" (~13%)
+At fixed ~29k context, the **262k config decodes ~15–20% faster than 1M** even though the prompt is identical. Cause: the compiled b12x decode kernel (`sparse_mla_decode_forward`) does per-step work **proportional to the allocated KV pool's `num_blocks`** (~2,500 @262k vs ~4,260 @1M) — i.e. the cost of *reserving* enough KV to ever serve a 1M-token request, paid even on short prompts. Proven structural / not fixable from Python:
+- `VLLM_DSPARK_INDEXER_PT_CAP` (cudagraph-stable cap of the indexer page-table width) recovers **0%** → the indexer page-table is *not* the bottleneck.
+- `--block-size 512` (would halve `num_blocks`) is **unsupported** — b12x hardcodes 256.
+- The KV pool can't shrink without losing the 1M ceiling; b12x ships compiled (no source).
+
+Guidance: run **262k** if your contexts stay under ~256k and you want max speed; run **1M** (the default here) when you need the deep-context ceiling (~238 interactive).
+
+## Concurrency (`max_num_seqs > 1`)
+Sustained 2 long requests in flight + frequent short finishers (forces continuous-batch condense): accept_len **4.19** (vs 4.52 single-stream), **0** incoherent/errored outputs, no `ValueError`; single-stream speed unchanged. (Greedy output is *not* byte-identical solo-vs-concurrent due to benign batch FP non-determinism — judge by acceptance health + coherence.)
 
 ## Stage timing (DSpark proposer, diagnostic)
-`draft ≈ 2.35 ms/step` (already PIECEWISE-cudagraphed) — **not** the bottleneck.
-Per-step time is dominated by the target verify of 1+5 positions. The RoPE fix
-raised acceptance, which cuts the number of verifies → the throughput gain.
+`draft ≈ 2.27 ms/step`, `prefill_main ≈ 5 ms` (3 draft layers × `store_main_kv`) — both already on the fast path. Per-step time is dominated by the target verify of 1+5 positions plus the `num_blocks`-proportional kernel cost above.
 
 ## Reproduce
 ```bash
-./setup.sh && docker compose -f docker-compose.dspark-b12x.yaml up -d
-python3 bench.py                  # see repo; edit MODEL=deepseek/v4flash[dspark]
+./setup.sh && VLLM_API_KEY=sk-... docker compose -f docker-compose.dspark-b12x.yaml up -d
+# server-side decode (canonical):  benchmarks/decode_sustained.sh
+# prefill/TTFT/decode vs depth:     benchmarks/depth_sweep.py
+# per-prompt acceptance:            benchmarks/accept_perprompt.py
+# concurrency / long-context:       benchmarks/concurrency_test.py , benchmarks/needle.py
 ```
-
----
-
-## 2026-06-29 — server-side decode (the reliable method), vs localmaxxing MTP bench (181 tok/s)
-
-Measured from the engine's `Avg generation throughput` over pure-decode windows (single stream, greedy, 262k cfg). Throughput is content-dependent (acceptance-driven):
-
-| workload | ctx | DSpark tok/s | accept_len | MTP tok/s | MTP accept |
-|---|---|---|---|---|---|
-| code/structured | ~29k | **262** (257-278) | 4.5 | ~208 | 2.6 |
-| code/structured | ~82k | 237 | 4.8 | — | — |
-| reasoning (think=high) | 37k | 187 (160-215) | 3.3 | ~181 (bench) | — |
-| 1M-config, code | ~29k | 196 | 4.45 | — | — |
-
-**DSpark beats MTP by ~26% on identical code prompts** (262 vs 208), and beats the 181 reasoning bench on reasoning (187). 1M config is ~25% slower than 262k at fixed context (indexer page-table width; see `VLLM_DSPARK_INDEXER_PT_TRIM`).
-
-### Concurrency (max_num_seqs>1)
-Sustained 2-in-flight + short finishers (forces batch condense): accept_len **4.19** (vs 4.52 single-stream), 0 incoherent/errored, no ValueError. Single-stream speed unchanged.
-
-### Measurement caveat
-Client-side streaming **inflates** decode rate (spec-decode token bursts buffer on the client → compressed inter-token window); differential timing **deflates** it (prefix-cache asymmetry). Trust the server `Avg generation throughput`.
-
-## 1M-context decode (default config)
-Single-stream interactive decode, code workload, `--max-model-len 1048576` (1.10M-token KV):
-- **DSpark @ 1M: ~238 tok/s** (236–240, stable) — clears 230; vs 262k config ~262.
-- The ~10–13% gap is a compiled b12x decode-kernel cost ∝ KV `num_blocks`; not fixable from Python (indexer page-table cap = 0% recovery; block_size 512 unsupported; KV can't shrink). 238 is the 1M interactive ceiling on this box.
-- Saturated back-to-back load reads ~227 (next request's chunked prefill steals decode windows — serving-throughput artifact, not interactive rate).

@@ -8,7 +8,7 @@ MTP — so it wins on technical / structured generation.
 
 It is delivered as an **overlay** on the prebuilt B12X vLLM image
 (`voipmonitor/vllm:chthonic-consecration-f1190eab-b12x0ff2847-pr20-cu132`,
-vLLM `0.11.2.dev279`, CUDA 13.2): 7 new files + small edits to 6 existing files,
+vLLM `0.11.2.dev279`, CUDA 13.2): 5 new files + small edits to 8 existing files,
 plus the exact serve config and the two environment fixes the b12x image needs.
 
 > Status: **working & coherent**, running on b12x's full **compile + cudagraph**
@@ -40,16 +40,18 @@ The enabling fix was a draft-RoPE off-by-one (below): acceptance 2.86 → 3.24 b
 - `models/deepseek_v4/nvidia/dspark.py` — the DSpark draft model (HC stages + Markov/HC/confidence heads). **Contains the key RoPE fix.**
 - `models/deepseek_v4/nvidia/dspark_kernels.py` — DSpark Triton kernels (sparse-MLA draft attention, markov-argmax, etc.).
 - `models/deepseek_v4/nvidia/ops/fp8_einsum.py` — vendored `deepseek_v4_fp8_einsum` (+ `deepseek_v4_fp8_einsum_config`); b12x lacks it. Returns the **(1,128,128)** recipe for sm120 (the b12x `o_proj.compute_fp8_einsum_recipe` returns the SM100 `(1,1,128)` → `scale_out_blocks=1024` which the einsum rejects).
-- `v1/spec_decode/dspark_proposer.py` — `DSparkProposer` (V1 model-runner proposer; manages draft buffers + PIECEWISE draft cudagraph).
+- `v1/spec_decode/dspark_proposer.py` — `DSparkProposer` (V1 model-runner proposer; manages draft buffers + PIECEWISE draft cudagraph). Also carries the **concurrency** fix (req-id→KV-slot map + ragged `query_start_loc` path) — see the Update section.
 - `v1/spec_decode/dspark.py` — DSpark proposer helpers.
 
-### Edits to existing files (see `patches/dspark-b12x.patch`)
+### Edits to existing files (the complete change set is the full files in [`overlay/vllm/`](overlay/vllm/))
 - `config/speculative.py` — route `dspark_block_size`-carrying checkpoints to method `dspark` (`DeepSeekV4DSparkModel`); `use_dspark()`.
 - `model_executor/models/registry.py` — register `DeepSeekV4DSparkModel`.
 - `models/deepseek_v4/__init__.py` — export `DeepSeekV4DSpark`.
-- `v1/worker/gpu_model_runner.py` — dispatch `use_dspark()` → `DSparkProposer`; add to the proposer isinstance unions.
+- `v1/worker/gpu_model_runner.py` — dispatch `use_dspark()` → `DSparkProposer`; proposer isinstance unions; thread `req_ids` for the concurrency slot-map; `INDEXER_PT_CAP` over-cap eager-fallback.
 - `v1/spec_decode/llm_base_proposer.py` — dspark hooks (noise-token id, aux-reduce, draft-class-skip, guard `compute_logits` introspection).
 - `models/deepseek_v4/nvidia/model.py` — **EAGLE3 aux-hidden-state interface** on `DeepseekV4ForCausalLM` (collect HC-reduced hidden at layers 40/41/42 to seed the draft). **The aux collection uses `b12x_mhc_post` (not `mhc_post_tilelang`) so the target still compiles/cudagraphs** — calling tilelang in the aux path triggers torch.compile "function marked as skipped".
+- `v1/attention/backends/mla/indexer.py` — `VLLM_DSPARK_BT_COPY_TRIM` (default on: trim the per-step block-table copy to live context) + cudagraph-stable `VLLM_DSPARK_INDEXER_PT_CAP` (high-context experiment; see Update).
+- `model_executor/layers/sparse_attn_indexer.py` — consume the capped page-table width (paired with `INDEXER_PT_CAP`).
 
 ### THE acceptance fix (`dspark.py`, draft RoPE off-by-one)
 `draft_input_ids[:,0]` is the **bonus** token (the just-sampled `next_token_ids`),
