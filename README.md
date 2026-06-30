@@ -8,7 +8,7 @@ MTP — so it wins on technical / structured generation.
 
 It is delivered as an **overlay** on the prebuilt B12X vLLM image
 (`voipmonitor/vllm:chthonic-consecration-f1190eab-b12x0ff2847-pr20-cu132`,
-vLLM `0.11.2.dev279`, CUDA 13.2): 5 new files + small edits to 6 existing files,
+vLLM `0.11.2.dev279`, CUDA 13.2): 7 new files + small edits to 6 existing files,
 plus the exact serve config and the two environment fixes the b12x image needs.
 
 > Status: **working & coherent**, running on b12x's full **compile + cudagraph**
@@ -18,21 +18,19 @@ plus the exact serve config and the two environment fixes the b12x image needs.
 
 ## TL;DR benchmarks (2× RTX PRO 6000, TP2, single stream, greedy)
 
-| Config | mean accept | pos-0 accept | broad avg tok/s | peak tok/s | context |
-|---|---|---|---|---|---|
-| jasl FP8 (no spec) | — | — | ~82 | — | 1M |
-| **b12x MTP** (default) | 2.2 | 0.787 | ~175 | ~194 | 1M |
-| b12x DSpark (initial port) | 2.86 | 0.73 | ~145 | 188 | — |
-| **b12x DSpark + RoPE fix** | **3.24** | **0.80** | **168** | **234** | 16k* |
+Decode tok/s is **server-side** (`Avg generation throughput`); **content-dependent** — acceptance drives throughput (code/structured ~4.5, reasoning ~3.3, creative ~2.2).
 
-*16k is the current test value; raise `--max-model-len` (see Tuning). DSpark
-**beats MTP on technical/structured content** (code 234, science 210) and matches
-it on average; MTP is flatter across creative prompts. Acceptance is content
-dependent (observed windows 2.6–4.3).
+| Config (code workload) | accept len | decode tok/s | context |
+|---|---|---|---|
+| jasl FP8 — no spec decode | — | ~82 | 1M |
+| b12x MTP (num_spec=2) | 2.6 | ~208 | 262k |
+| **b12x DSpark (num_spec=5)** | **4.5** | **~262** | 262k |
+| b12x DSpark @ 1M | 4.5 | ~238 (interactive) | 1M |
+| localmaxxing MTP n=1 run (the target) | — | 181 | 262k |
 
-The headline correctness fix (see below) lifted DSpark from 2.86→3.24 mean
-acceptance and ~145→168 avg tok/s, with position-0 acceptance now exceeding MTP's
-— i.e. DSpark behaving like the trained block drafter it is.
+**DSpark beats MTP by ~26% on code** (262 vs 208) and clears the 181 tok/s leaderboard run; at 1M context it holds ~238 (a flat ~13% `num_blocks` reservation tax vs 262k). Prefill ~6k tok/s @ ~30k; TTFT scales with depth (sub-second @4k → minutes near 1M). See [BENCHMARKS.md](BENCHMARKS.md) and [`benchmarks/`](benchmarks/) for the full curves, the reasoning/creative numbers, and the harness + prompts.
+
+The enabling fix was a draft-RoPE off-by-one (below): acceptance 2.86 → 3.24 broad (4.5+ on code), pos-0 now > MTP's — DSpark behaving like the trained block drafter it is.
 
 ---
 
@@ -111,7 +109,7 @@ Served as `deepseek/v4flash` on `:8001` (OpenAI-compatible).
   **not** the bottleneck. The per-step cost is the target verify of 1+5 positions.
 
 ## Tuning
-- Raise `--max-model-len` (16384 is a test value; KV is sparse-MLA + fp8 so large
+- `--max-model-len` defaults to 1M here; lower it (e.g. 262k) for ~15-20% faster decode if you don't need the full ceiling. KV is sparse-MLA + fp8 so large
   contexts fit — the MTP profile runs 1M). Watch the cudagraph KV reservation;
   bump `--gpu-memory-utilization` if KV doesn't fit.
 - `--max-num-seqs 4` is interactive-tuned; raise for batched throughput.
