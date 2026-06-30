@@ -87,7 +87,7 @@ docker compose -f docker-compose.dspark-b12x.yaml up -d
 curl localhost:8001/v1/models -H "Authorization: Bearer $VLLM_API_KEY"
 ```
 
-Served as `deepseek/v4flashdspark` on `:8001` (OpenAI-compatible).
+Served as `deepseek/v4flash` on `:8001` (OpenAI-compatible).
 
 ### Two image gotchas the compose handles for you
 1. **NCCL "unhandled system error"** — the image bakes `NCCL_GRAPH_FILE=` (empty);

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Broad single-stream decode benchmark. Set MODEL to deepseek/v4flashdspark or deepseek/v4flash."""
+"""Broad single-stream decode benchmark. Set BENCH_MODEL (served name, default deepseek/v4flash)."""
 import os, time, json, urllib.request
 KEY = os.environ.get("VLLM_API_KEY", "")
-MODEL = os.environ.get("BENCH_MODEL", "deepseek/v4flashdspark")
+MODEL = os.environ.get("BENCH_MODEL", "deepseek/v4flash")
 URL = "http://localhost:8001/v1/chat/completions"
 def gen(p, mx=256):
     body = json.dumps({"model": MODEL, "messages": [{"role": "user", "content": p}],

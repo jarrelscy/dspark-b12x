@@ -72,7 +72,7 @@ services:
       - >
         unset NCCL_GRAPH_FILE NCCL_GRAPH_DUMP_FILE VLLM_B12X_MLA_EXTEND_MAX_CHUNKS;
         exec /opt/venv/bin/vllm serve deepseek-ai/DeepSeek-V4-Flash-DSpark
-        --served-model-name deepseek/v4flashdspark
+        --served-model-name deepseek/v4flash
         --host 0.0.0.0 --port 8001
         --trust-remote-code
         --kv-cache-dtype fp8 --block-size 256 --load-format safetensors
