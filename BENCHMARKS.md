@@ -43,13 +43,17 @@ Decode here is client-side end-to-end (~10–15% under server-side), so read the
 - **TTFT** is prefill-dominated: sub-second at 4k → minutes near 1M.
 - **Decode falls with real context depth** in both configs (attention over a deeper KV per step).
 
-## The 1M "reservation tax" (~13%)
-At fixed ~29k context, the **262k config decodes ~15–20% faster than 1M** even though the prompt is identical. Cause: the compiled b12x decode kernel (`sparse_mla_decode_forward`) does per-step work **proportional to the allocated KV pool's `num_blocks`** (~2,500 @262k vs ~4,260 @1M) — i.e. the cost of *reserving* enough KV to ever serve a 1M-token request, paid even on short prompts. Proven structural / not fixable from Python:
-- `VLLM_DSPARK_INDEXER_PT_CAP` (cudagraph-stable cap of the indexer page-table width) recovers **0%** → the indexer page-table is *not* the bottleneck.
-- `--block-size 512` (would halve `num_blocks`) is **unsupported** — b12x hardcodes 256.
-- The KV pool can't shrink without losing the 1M ceiling; b12x ships compiled (no source).
+## The 1M "reservation tax" (~13%) — structural, not a b12x bug
+At fixed ~29k context, the **262k config decodes ~15–20% faster than 1M** even though the prompt is identical. We chased this all the way into the kernel:
 
-Guidance: run **262k** if your contexts stay under ~256k and you want max speed; run **1M** (the default here) when you need the deep-context ceiling (~238 interactive).
+- b12x is **CuTe-DSL Python source** (not a compiled blob — `attention/mla/kernel.py` etc.), so it's fully forkable. A full read of the sparse-MLA decode path found **no fixable per-step op**: no TMA descriptor built over the pool, no pool-sized memset/validation/loop, grid + loops are topk/live-bounded, and the JIT-compiled kernel is **byte-identical** across the two configs (same compile-spec hash, sub-2³¹ addressing).
+- The only device-side difference: the kernel gathers topk-**scattered** KV blocks across a physically larger allocation (the 1M pool ≥5.7 GB vs ~0.4–0.6 GB) → worse **L2 / TLB / DRAM locality** for the `cp.async.bulk` gathers. You can't narrow the CuTe tensor to "live blocks" — they're non-contiguous and change per step (illegal under cudagraph).
+- The big pool is **inseparable from `max-model-len=1M`**: vLLM rejects forcing a smaller pool (`num-gpu-blocks-override`) because it requires the KV cache to hold ≥1 full max-len request (5.67 GB). So 1M-len *mandates* the larger pool, hence the locality cost.
+- Also ruled out: `VLLM_DSPARK_INDEXER_PT_CAP` (cudagraph-stable page-table cap) recovers **0%**; `--block-size 512` (would halve `num_blocks`) is **unsupported** (b12x hardcodes 256).
+
+So **238 tok/s is the real 1M-interactive ceiling on this stack** — not closable by editing b12x. The only speed levers are outside the kernel: lower `--max-model-len` (smaller pool → faster), or a vLLM block-allocator change to keep a sequence's active blocks compacted (so the gather working set tracks live context).
+
+Guidance: run **262k** if your contexts stay under ~256k and you want max speed (~262); run **1M** (the default here) when you need the deep-context ceiling (~238 interactive).
 
 ## Concurrency (`max_num_seqs > 1`)
 Sustained 2 long requests in flight + frequent short finishers (forces continuous-batch condense): accept_len **4.19** (vs 4.52 single-stream), **0** incoherent/errored outputs, no `ValueError`; single-stream speed unchanged. (Greedy output is *not* byte-identical solo-vs-concurrent due to benign batch FP non-determinism — judge by acceptance health + coherence.)
